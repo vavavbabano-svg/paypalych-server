@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import logging
 import json
 import os
@@ -6,6 +7,7 @@ import requests
 from datetime import datetime, date
 
 app = Flask(__name__)
+CORS(app)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -65,7 +67,6 @@ def send_telegram_notification(text: str):
 
 @app.route("/create-invoice", methods=["POST"])
 def create_invoice():
-    """Создание счёта через Enot API"""
     data = request.get_json()
     if not data:
         return jsonify({"error": "Нет данных"}), 400
@@ -112,7 +113,6 @@ def create_invoice():
 
 @app.route("/paypalych/result", methods=["POST"])
 def paypalych_result():
-    """Обработка результата платежа от Enot"""
     if request.is_json:
         data = request.get_json()
     else:
@@ -166,39 +166,23 @@ def paypalych_result():
 
 @app.route("/admin/stats", methods=["GET"])
 def admin_stats():
-    """Статистика для админки"""
     today = date.today().isoformat()
-    
-    # Заказы за сегодня
     today_orders = [o for o in orders if o.get("time", "").startswith(today)]
     today_success = [o for o in today_orders if o.get("status") in ["success", "paid", "completed", "1", "ok"]]
     
-    # Сумма и количество
-    today_total = sum(float(o.get("amount", 0)) for o in today_success)
-    today_count = len(today_success)
-    today_stars = sum(int(o.get("stars", 0)) for o in today_success)
-    
-    # Всего
     all_success = [o for o in orders if o.get("status") in ["success", "paid", "completed", "1", "ok"]]
-    all_total = sum(float(o.get("amount", 0)) for o in all_success)
-    all_count = len(all_success)
-    all_stars = sum(int(o.get("stars", 0)) for o in all_success)
-    
-    # Последние 5 заказов
-    recent = sorted(orders, key=lambda o: o.get("time", ""), reverse=True)[:5]
     
     return jsonify({
         "today": {
-            "count": today_count,
-            "amount": round(today_total, 2),
-            "stars": today_stars
+            "count": len(today_success),
+            "amount": round(sum(float(o.get("amount", 0)) for o in today_success), 2),
+            "stars": sum(int(o.get("stars", 0)) for o in today_success)
         },
         "all": {
-            "count": all_count,
-            "amount": round(all_total, 2),
-            "stars": all_stars
+            "count": len(all_success),
+            "amount": round(sum(float(o.get("amount", 0)) for o in all_success), 2),
+            "stars": sum(int(o.get("stars", 0)) for o in all_success)
         },
-        "recent": recent,
         "fragment_ready": FRAGMENT_READY,
         "enot_configured": bool(ENOT_SHOP_ID)
     }), 200
