@@ -3,7 +3,7 @@ import logging
 import json
 import os
 import requests
-from datetime import datetime
+from datetime import datetime, date
 
 app = Flask(__name__)
 
@@ -16,6 +16,9 @@ ADMIN_TG_ID = os.environ.get("ADMIN_TG_ID", "1444520038")
 ENOT_SHOP_ID = os.environ.get("ENOT_SHOP_ID", "c2d5e47109ad1d1bccaacdde76130c892a7b5a47")
 ENOT_SECRET_KEY = os.environ.get("ENOT_SECRET_KEY", "1bc606d038c11a6380d65872e9946e3a00504337")
 ENOT_API_URL = "https://api.enot.io"
+
+# Хранилище заказов (в памяти)
+orders = []
 
 # Fragment API
 try:
@@ -32,7 +35,6 @@ def buy_stars_for_user(username: str, stars: int) -> bool:
     if not FRAGMENT_READY or not TON_SEED:
         logger.error("❌ Fragment API не доступен")
         return False
-    
     try:
         clean_username = username.replace("@", "")
         logger.info(f"🛒 Покупаю {stars} звёзд для @{clean_username}")
@@ -59,11 +61,12 @@ def send_telegram_notification(text: str):
         pass
 
 
+# ==================== API ЭНДПОИНТЫ ====================
+
 @app.route("/create-invoice", methods=["POST"])
 def create_invoice():
     """Создание счёта через Enot API"""
     data = request.get_json()
-    
     if not data:
         return jsonify({"error": "Нет данных"}), 400
     
@@ -95,17 +98,13 @@ def create_invoice():
     }
     
     try:
-        logger.info(f"📤 Создаю счёт в Enot: {json.dumps(payload, indent=2)}")
         response = requests.post(f"{ENOT_API_URL}/invoice/create", json=payload, headers=headers, timeout=10)
         response.raise_for_status()
         invoice_data = response.json()
-        logger.info(f"✅ Счёт создан: {invoice_data}")
-        
         if invoice_data.get("url"):
             return jsonify({"url": invoice_data["url"]}), 200
         else:
             return jsonify({"error": "Не получена ссылка на оплату"}), 500
-    
     except requests.exceptions.RequestException as e:
         logger.error(f"❌ Ошибка Enot API: {e}")
         return jsonify({"error": str(e)}), 500
@@ -114,7 +113,6 @@ def create_invoice():
 @app.route("/paypalych/result", methods=["POST"])
 def paypalych_result():
     """Обработка результата платежа от Enot"""
-    
     if request.is_json:
         data = request.get_json()
     else:
@@ -126,7 +124,6 @@ def paypalych_result():
     amount = data.get("amount") or data.get("Amount") or data.get("sum")
     status = data.get("status") or data.get("Status") or data.get("payment_status")
     
-    # Enot передаёт customFields
     custom_fields = data.get("customFields", {})
     if isinstance(custom_fields, str):
         try:
@@ -137,13 +134,24 @@ def paypalych_result():
     username = custom_fields.get("username") or data.get("username")
     stars = custom_fields.get("stars") or data.get("stars")
     
+    # Сохраняем заказ
+    order = {
+        "order_id": order_id,
+        "amount": amount,
+        "status": status,
+        "username": username,
+        "stars": stars,
+        "time": datetime.now().isoformat()
+    }
+    orders.append(order)
+    
     if status in ["success", "paid", "completed", "1", "ok"]:
         logger.info(f"✅ Заказ #{order_id} оплачен: {amount}")
-        
         if username and stars:
             stars_int = int(stars) if stars else 0
             if stars_int > 0:
                 success = buy_stars_for_user(username, stars_int)
+                order["stars_bought"] = success
                 if success:
                     send_telegram_notification(
                         f"✅ Автопокупка звёзд\n"
@@ -153,10 +161,47 @@ def paypalych_result():
                         f"Сумма: {amount}"
                     )
     
-    elif status in ["fail", "failed", "error", "0", "cancelled"]:
-        logger.warning(f"❌ Заказ #{order_id} не оплачен: {status}")
-    
     return "OK", 200
+
+
+@app.route("/admin/stats", methods=["GET"])
+def admin_stats():
+    """Статистика для админки"""
+    today = date.today().isoformat()
+    
+    # Заказы за сегодня
+    today_orders = [o for o in orders if o.get("time", "").startswith(today)]
+    today_success = [o for o in today_orders if o.get("status") in ["success", "paid", "completed", "1", "ok"]]
+    
+    # Сумма и количество
+    today_total = sum(float(o.get("amount", 0)) for o in today_success)
+    today_count = len(today_success)
+    today_stars = sum(int(o.get("stars", 0)) for o in today_success)
+    
+    # Всего
+    all_success = [o for o in orders if o.get("status") in ["success", "paid", "completed", "1", "ok"]]
+    all_total = sum(float(o.get("amount", 0)) for o in all_success)
+    all_count = len(all_success)
+    all_stars = sum(int(o.get("stars", 0)) for o in all_success)
+    
+    # Последние 5 заказов
+    recent = sorted(orders, key=lambda o: o.get("time", ""), reverse=True)[:5]
+    
+    return jsonify({
+        "today": {
+            "count": today_count,
+            "amount": round(today_total, 2),
+            "stars": today_stars
+        },
+        "all": {
+            "count": all_count,
+            "amount": round(all_total, 2),
+            "stars": all_stars
+        },
+        "recent": recent,
+        "fragment_ready": FRAGMENT_READY,
+        "enot_configured": bool(ENOT_SHOP_ID)
+    }), 200
 
 
 @app.route("/paypalych/refund", methods=["POST"])
