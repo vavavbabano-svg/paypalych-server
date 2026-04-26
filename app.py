@@ -1,5 +1,4 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 import logging
 import json
 import os
@@ -7,22 +6,31 @@ import requests
 from datetime import datetime, date
 
 app = Flask(__name__)
-CORS(app)
+
+# CORS вручную (без flask-cors)
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, x-api-key"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Конфигурация
+# ==================== КОНФИГУРАЦИЯ ====================
 TON_SEED = os.environ.get("TON_SEED", "")
 ADMIN_TG_ID = os.environ.get("ADMIN_TG_ID", "1444520038")
-ENOT_SHOP_ID = os.environ.get("ENOT_SHOP_ID", "c2d5e47109ad1d1bccaacdde76130c892a7b5a47")
-ENOT_SECRET_KEY = os.environ.get("ENOT_SECRET_KEY", "1bc606d038c11a6380d65872e9946e3a00504337")
+ENOT_SHOP_ID = os.environ.get("ENOT_SHOP_ID", "")
+ENOT_SECRET_KEY = os.environ.get("ENOT_SECRET_KEY", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ENOT_API_URL = "https://api.enot.io"
 
-# Хранилище заказов (в памяти)
-orders = []
+# ==================== ХРАНИЛИЩА ====================
+orders = []                # Все заказы
+processed_orders = set()   # Защита от повторов (anti-replay)
 
-# Fragment API
+# ==================== FRAGMENT API ====================
 try:
     from fragment_api_lib.client import FragmentAPIClient
     fragment = FragmentAPIClient()
@@ -33,7 +41,10 @@ except Exception as e:
     logger.warning(f"⚠️ Fragment API не загружен: {e}")
 
 
+# ==================== ФУНКЦИИ ====================
+
 def buy_stars_for_user(username: str, stars: int) -> bool:
+    """Покупка звёзд через Fragment API"""
     if not FRAGMENT_READY or not TON_SEED:
         logger.error("❌ Fragment API не доступен")
         return False
@@ -53,11 +64,11 @@ def buy_stars_for_user(username: str, stars: int) -> bool:
 
 
 def send_telegram_notification(text: str):
-    bot_token = os.environ.get("BOT_TOKEN", "")
-    if not bot_token:
+    """Отправка уведомления в Telegram"""
+    if not BOT_TOKEN:
         return
     try:
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         requests.post(url, json={"chat_id": ADMIN_TG_ID, "text": text}, timeout=5)
     except:
         pass
@@ -67,6 +78,7 @@ def send_telegram_notification(text: str):
 
 @app.route("/create-invoice", methods=["POST"])
 def create_invoice():
+    """Создание счёта через Enot API"""
     data = request.get_json()
     if not data:
         return jsonify({"error": "Нет данных"}), 400
@@ -84,7 +96,7 @@ def create_invoice():
         "amount": str(amount),
         "orderId": f"stars-{stars}-{int(datetime.now().timestamp())}",
         "currency": currency,
-        "hookUrl": "https://paypalych-server.onrender.com/paypalych/result",
+        "hookUrl": "https://paypalych-server.onrender.com/enot/result",
         "successUrl": "https://telegram-mini-app.vavavbabano.workers.dev/success.html",
         "failUrl": "https://telegram-mini-app.vavavbabano.workers.dev/fail.html",
         "customFields": {
@@ -111,8 +123,9 @@ def create_invoice():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/paypalych/result", methods=["POST"])
-def paypalych_result():
+@app.route("/enot/result", methods=["POST"])
+def enot_result():
+    """Обработка результата платежа от ENOT"""
     if request.is_json:
         data = request.get_json()
     else:
@@ -124,6 +137,13 @@ def paypalych_result():
     amount = data.get("amount") or data.get("Amount") or data.get("sum")
     status = data.get("status") or data.get("Status") or data.get("payment_status")
     
+    # Защита от повторов
+    if order_id in processed_orders:
+        logger.warning(f"⚠️ Повторный запрос для заказа #{order_id}")
+        return "OK", 200
+    processed_orders.add(order_id)
+    
+    # Разбираем customFields
     custom_fields = data.get("customFields", {})
     if isinstance(custom_fields, str):
         try:
@@ -145,6 +165,7 @@ def paypalych_result():
     }
     orders.append(order)
     
+    # Обработка успешного платежа
     if status in ["success", "paid", "completed", "1", "ok"]:
         logger.info(f"✅ Заказ #{order_id} оплачен: {amount}")
         if username and stars:
@@ -160,12 +181,44 @@ def paypalych_result():
                         f"Звёзд: {stars_int}\n"
                         f"Сумма: {amount}"
                     )
+                else:
+                    send_telegram_notification(
+                        f"⚠️ Оплата прошла, но звёзды не куплены\n"
+                        f"Заказ: #{order_id}\n"
+                        f"Кому: @{username}\n"
+                        f"Звёзд: {stars_int}"
+                    )
     
+    elif status in ["fail", "failed", "error", "0", "cancelled"]:
+        logger.warning(f"❌ Заказ #{order_id} не оплачен")
+    
+    return "OK", 200
+
+
+@app.route("/enot/refund", methods=["POST"])
+def enot_refund():
+    if request.is_json:
+        data = request.get_json()
+    else:
+        data = request.form.to_dict()
+    logger.info(f"💰 Refund: {json.dumps(data, indent=2, ensure_ascii=False)}")
+    return "OK", 200
+
+
+@app.route("/enot/chargeback", methods=["POST"])
+def enot_chargeback():
+    if request.is_json:
+        data = request.get_json()
+    else:
+        data = request.form.to_dict()
+    logger.warning(f"⚠️ Chargeback: {json.dumps(data, indent=2, ensure_ascii=False)}")
+    send_telegram_notification(f"🚨 ЧАРДЖБЭК!\n{json.dumps(data, indent=2)}")
     return "OK", 200
 
 
 @app.route("/admin/stats", methods=["GET"])
 def admin_stats():
+    """Статистика для админки"""
     today = date.today().isoformat()
     today_orders = [o for o in orders if o.get("time", "").startswith(today)]
     today_success = [o for o in today_orders if o.get("status") in ["success", "paid", "completed", "1", "ok"]]
@@ -186,27 +239,6 @@ def admin_stats():
         "fragment_ready": FRAGMENT_READY,
         "enot_configured": bool(ENOT_SHOP_ID)
     }), 200
-
-
-@app.route("/paypalych/refund", methods=["POST"])
-def paypalych_refund():
-    if request.is_json:
-        data = request.get_json()
-    else:
-        data = request.form.to_dict()
-    logger.info(f"💰 Refund: {json.dumps(data, indent=2, ensure_ascii=False)}")
-    return "OK", 200
-
-
-@app.route("/paypalych/chargeback", methods=["POST"])
-def paypalych_chargeback():
-    if request.is_json:
-        data = request.get_json()
-    else:
-        data = request.form.to_dict()
-    logger.warning(f"⚠️ Chargeback: {json.dumps(data, indent=2, ensure_ascii=False)}")
-    send_telegram_notification(f"🚨 ЧАРДЖБЭК!\n{json.dumps(data, indent=2)}")
-    return "OK", 200
 
 
 @app.route("/health", methods=["GET"])
